@@ -1,0 +1,53 @@
+; SPDX-License-Identifier: MIT
+; PDM (Delta-Sigma Modulation) audio output
+;
+; Single-instruction PIO program: shifts one bit from OSR to the output pin.
+; Autopull refills the OSR when empty (32-bit threshold, LSB-first).
+;
+; The PIO clock divider is set so the bit rate = sample_rate * PDM_OVERSAMPLE.
+; At 115.2 MHz sys clock and 48 kHz:
+;   32× oversample: clkdiv = 115200000 / (48000 * 32) = 75.0  (exact)
+;   64× oversample: clkdiv = 115200000 / (48000 * 64) = 37.5  (exact)
+;
+; Each 32-bit word pushed to the TX FIFO represents 32 PDM bit periods.
+; Use DMA to feed the FIFO continuously from a pre-computed PDM word buffer.
+
+.program pdm_audio
+
+.wrap_target
+    out pins, 1     ; shift one bit to output pin; autopull refills OSR
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void pdm_audio_program_init(PIO pio, uint sm, uint offset,
+                                          uint pin, uint32_t sample_rate) {
+    pio_sm_config c = pdm_audio_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&c, pin, 1);
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+
+    // Join TX FIFOs for deeper buffer (8 words instead of 4)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // Bit rate = sample_rate * PDM_OVERSAMPLE
+    // e.g. 115.2 MHz / (48000 * 64) = 37.5 exactly (representable in 8-bit frac divider)
+    float clkdiv = (float)clock_get_hz(clk_sys) / ((float)sample_rate * PDM_OVERSAMPLE);
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    // LSB first (bit 0 outputs first), autopull at 32 bits
+    sm_config_set_out_shift(&c, true, true, 32);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void pdm_audio_program_set_sample_rate(PIO pio, uint sm,
+                                                      uint32_t sample_rate) {
+    float clkdiv = (float)clock_get_hz(clk_sys) / ((float)sample_rate * PDM_OVERSAMPLE);
+    pio_sm_set_clkdiv(pio, sm, clkdiv);
+}
+%}

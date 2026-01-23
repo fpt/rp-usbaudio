@@ -1,0 +1,88 @@
+; SPDX-License-Identifier: MIT
+; I2S PIO program for PCM5101 DAC - 64 BCK version
+; Based on pico-extras audio_i2s.pio
+;
+; Standard I2S format with 64 BCK per frame (32 per channel):
+; - LRCLK transitions 1 BCK before MSB
+; - Data latched on rising edge of BCK
+; - 16-bit sample left-justified in 32-bit slot
+;
+; Data format: Two 32-bit words per stereo frame
+;   Word 0: left_sample << 16  (sample in upper 16 bits)
+;   Word 1: right_sample << 16
+;
+; Side set: bit 0 = BCLK, bit 1 = LRCLK
+
+.program i2s_audio
+.side_set 2
+
+                    ;        /--- LRCLK
+                    ;        |/-- BCLK
+bitloop1:           ;        ||   (Right channel, LRCLK=1, 32 bits)
+    out pins, 1       side 0b10    ; LRCLK=1, BCLK=0
+    jmp x-- bitloop1  side 0b11    ; LRCLK=1, BCLK=1 (latch)
+    out pins, 1       side 0b00    ; LRCLK=0, BCLK=0 (LRCLK transitions!)
+    set x, 30         side 0b01    ; LRCLK=0, BCLK=1 (latch last bit)
+
+bitloop0:                          ; (Left channel, LRCLK=0, 32 bits)
+    out pins, 1       side 0b00    ; LRCLK=0, BCLK=0
+    jmp x-- bitloop0  side 0b01    ; LRCLK=0, BCLK=1 (latch)
+    out pins, 1       side 0b10    ; LRCLK=1, BCLK=0 (LRCLK transitions!)
+public entry_point:
+    set x, 30         side 0b11    ; LRCLK=1, BCLK=1 (latch last bit)
+                                   ; wraps to bitloop1
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void i2s_audio_program_init(PIO pio, uint sm, uint offset,
+                                          uint pin_din, uint pin_bclk,
+                                          uint sample_rate) {
+    pio_sm_config c = i2s_audio_program_get_default_config(offset);
+
+    // OUT pin is DIN
+    sm_config_set_out_pins(&c, pin_din, 1);
+
+    // Side-set pins are BCLK (bit 0) and LRCK (bit 1)
+    sm_config_set_sideset_pins(&c, pin_bclk);
+
+    // Shift OSR to the left (MSB first), autopull at 32 bits
+    sm_config_set_out_shift(&c, false, true, 32);
+
+    // FIFO join for TX only
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // Calculate clock divider for 64 BCK per frame
+    // Each bit takes 2 PIO cycles
+    float bit_clock = sample_rate * 64.0f;
+    float pio_clock = bit_clock * 2.0f;
+    float divider = (float)clock_get_hz(clk_sys) / pio_clock;
+    sm_config_set_clkdiv(&c, divider);
+
+    // Initialize state machine
+    pio_sm_init(pio, sm, offset, &c);
+
+    // Set pin directions
+    uint32_t pin_mask = (1u << pin_din) | (3u << pin_bclk);
+    pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+    pio_sm_set_pins(pio, sm, 0);  // Clear pins
+
+    // Initialize GPIO
+    pio_gpio_init(pio, pin_din);
+    pio_gpio_init(pio, pin_bclk);
+    pio_gpio_init(pio, pin_bclk + 1);
+
+    // Jump to entry point and enable
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset + i2s_audio_offset_entry_point));
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void i2s_audio_program_set_sample_rate(PIO pio, uint sm,
+                                                      uint sample_rate) {
+    float bit_clock = sample_rate * 64.0f;
+    float pio_clock = bit_clock * 2.0f;
+    float divider = (float)clock_get_hz(clk_sys) / pio_clock;
+    pio_sm_set_clkdiv(pio, sm, divider);
+}
+%}

@@ -130,6 +130,17 @@ static bool dma_started = false;
 // Sigma-delta modulator state (lives across buffer fills)
 static sdm_state_t sdm;
 
+// TPDF dither: breaks SDM idle-tone patterns during silence.
+// Uses a Galois LFSR (period 2^32-1) for low-cost pseudo-random generation.
+// tpdf_dither() returns a triangular-distributed value in {-1, 0, 0, +1}
+// (sum of two independent 1-bit uniform draws), equivalent to ±1 LSB TPDF.
+static uint32_t dither_lfsr = 0xACE1CAFEu;
+
+static inline int16_t tpdf_dither(void) {
+    dither_lfsr = (dither_lfsr >> 1) ^ (-(dither_lfsr & 1u) & 0xB4BCD35Cu);
+    return (int16_t)((int32_t)(dither_lfsr & 1u) - (int32_t)((dither_lfsr >> 1) & 1u));
+}
+
 // Per-buffer tracking for stats
 static volatile bool buffer_written[NUM_DMA_BUFFERS] = {false, false};
 
@@ -194,9 +205,9 @@ static void fill_dma_buffer(uint32_t *buf) {
             had_underrun = true;
         }
 
-        // Mix stereo to mono, then run SDM PDM_WORDS_PER_FRAME times to
-        // produce PDM_OVERSAMPLE bits for this sample period.
-        int16_t mono = (int16_t)(((int32_t)left + right) / 2);
+        // Mix stereo to mono, add TPDF dither to break SDM idle tones,
+        // then run SDM PDM_WORDS_PER_FRAME times to produce PDM_OVERSAMPLE bits.
+        int16_t mono = (int16_t)(((int32_t)left + right) / 2 + tpdf_dither());
         for (uint32_t w = 0; w < PDM_WORDS_PER_FRAME; w++) {
             buf[i * PDM_WORDS_PER_FRAME + w] = sdm_process(&sdm, mono);
         }
